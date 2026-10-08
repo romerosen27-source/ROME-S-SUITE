@@ -78,7 +78,7 @@ button[aria-pressed="true"]{border-color:var(--led);color:var(--led)}
 
 <div id="help" class="chrome panel">
   <b>הליכה:</b> W A S D או החיצים<br>
-  <b>הסתכלות:</b> לחיצה על התמונה ואז עכבר (Esc לשחרור), או גרירה<br>
+  <b>הסתכלות:</b> ללחוץ על העכבר ולגרור<br>
   <b>ריצה:</b> Shift · <b>דלתות</b> נפתחות כשמתקרבים
 </div>
 
@@ -1254,9 +1254,9 @@ function collide(nx, nz) {
 const keys = {};
 addEventListener('keydown', e => { keys[e.code] = true; if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault(); });
 addEventListener('keyup', e => { keys[e.code] = false; });
-// mouse look: pointer lock if available, drag otherwise
+// mouse look: hold the button and drag
 let locked = false;
-canvas.addEventListener('click', () => { if (!isTouch && canvas.requestPointerLock) { try { const r = canvas.requestPointerLock(); if (r && r.catch) r.catch(() => {}); } catch (e) {} } });
+// no pointer lock: the cursor always stays visible so every button can be clicked; look = drag
 document.addEventListener('pointerlockchange', () => { locked = document.pointerLockElement === canvas; });
 document.addEventListener('mousemove', e => { if (locked) look(e.movementX, e.movementY, 0.0022); });
 function look(dx, dy, k) { player.yaw -= dx * k; player.pitch = Math.max(-1.2, Math.min(1.2, player.pitch - dy * k)); fly = null; }
@@ -1305,7 +1305,10 @@ const mapWrap = document.getElementById('mapwrap');
 tMap.onclick = () => { mapWrap.hidden = !mapWrap.hidden; tMap.setAttribute('aria-pressed', !mapWrap.hidden); };
 if (innerWidth < 700) { mapWrap.hidden = true; tMap.setAttribute('aria-pressed', 'false'); }
 const DPR_MAX = Math.min(devicePixelRatio || 1, 2);
-let dpr = DPR_MAX; // always full screen resolution
+// on ordinary (non-retina) screens render 1.5x and let the browser scale down: a sharper, cleaner still image
+let dpr = Math.max(DPR_MAX, 1.5);
+// never go softer than this (pixels per screen pixel) while moving
+const M_FLOOR = Math.min(1, 0.85 * (devicePixelRatio || 1) / dpr);
 function setQuality(q) {
   quality = 1;
   renderer.setPixelRatio(dpr);
@@ -1414,19 +1417,38 @@ function hideHintOnce() { if (hintShown) { hintShown = false; hideHint(); } }
 let frames = 0, lastZone = '', lastSig = '', stillFor = 0;
 // while moving, keep ~60 fps: lower the internal resolution in small steps only if
 // frames are slow, raise it back when there is headroom. Standing still is always full.
-let mAcc = 0, mN = 0, mLast = 0;
+// fixed steps so the motion buffers are re-created only a few times per visit
+const M_STEPS = [1, 0.85, 0.72, 0.62, 0.55].filter(v => v >= M_FLOOR - 0.001);
+if (!M_STEPS.length || M_STEPS[M_STEPS.length - 1] > M_FLOOR + 0.001) M_STEPS.push(M_FLOOR);
+let mAcc = 0, mN = 0, mLast = 0, mStep = Math.min(2, M_STEPS.length - 1), mGood = 0;
+mScale = M_STEPS[mStep]; // start in the middle; climbs to full if the device keeps up
+// ?debug in the address: small line with the graphics chip, frame rate and resolution
+const DEBUG = /debug/.test(location.search + location.hash);
+let dbgEl = null, dbgT = 0, dbgN = 0;
+if (DEBUG) {
+  dbgEl = document.createElement('div');
+  dbgEl.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:99;font:12px/1.4 monospace;color:#fff;background:rgba(0,0,0,.6);padding:6px 8px;border-radius:6px;direction:ltr;pointer-events:none;max-width:90vw';
+  document.body.appendChild(dbgEl);
+}
+function debugTick(now) {
+  if (!dbgEl) return;
+  if (now - dbgT < 1000) return;
+  const gl = renderer.getContext(), ext = gl.getExtension('WEBGL_debug_renderer_info');
+  const gpu = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  dbgEl.textContent = `${Math.round(dbgN * 1000 / (now - dbgT))} fps (moving) | ${gpu} | screen ${devicePixelRatio} | render ${dpr} x ${mScale.toFixed(2)} | ${canvas.width}x${canvas.height}`;
+  dbgT = now; dbgN = 0;
+}
 function motionFrames(raw) {
   if (!mcomp || raw > 0.25) return; // ignore hitches from tab switches
   mAcc += raw; mN++;
   const now = performance.now();
-  if (mN < 24 || now - mLast < 1200) return;
+  if (mN < 30 || now - mLast < 1500) return;
   const avg = mAcc / mN * 1000; mAcc = 0; mN = 0; mLast = now;
-  let ns = mScale;
-  if (avg > 19) ns = Math.max(0.6, mScale - (avg > 30 ? 0.15 : 0.08));
-  else if (avg < 14.5 && mScale < 1) ns = Math.min(1, mScale + 0.06);
-  if (Math.abs(ns - mScale) > 0.01) { mScale = ns; sizeMotion(); }
-}
-function shadowsAll() { scene.traverse(o => { if (o.isLight && o.castShadow) { o.shadow.autoUpdate = false; o.shadow.needsUpdate = true; } }); renderer.shadowMap.needsUpdate = true; }
+  let st = mStep;
+  if (avg > 19 && mStep < M_STEPS.length - 1) { st++; mGood = 0; }
+  else if (avg < 13 && mStep > 0 && ++mGood >= 3) { st--; mGood = 0; }
+  if (st !== mStep) { mStep = st; mScale = M_STEPS[st]; sizeMotion(); }
+}function shadowsAll() { scene.traverse(o => { if (o.isLight && o.castShadow) { o.shadow.autoUpdate = false; o.shadow.needsUpdate = true; } }); renderer.shadowMap.needsUpdate = true; }
 function shadowsNear(x, z, r) {
   for (const { l } of lights.warm) if (l.castShadow && Math.hypot(l.position.x - x, l.position.z - z) < r) { l.shadow.needsUpdate = true; renderer.shadowMap.needsUpdate = true; }
 }
@@ -1446,8 +1468,9 @@ function loop(now) {
   if (sig !== lastSig || renderer.shadowMap.needsUpdate) {
     lastSig = sig; stillFor = 0;
     if (mcomp && mScale < 1) mcomp.render(); else composer.render();
-    motionFrames(raw);
+    motionFrames(raw); dbgN++;
   } else if (++stillFor === 2) composer.render(); // stopped: one full-sharpness frame
+  debugTick(now);
   if ((frames++ & 7) === 0) {
     drawMap();
     const zn = zoneName(player.x, player.z); if (zn !== lastZone) { whereEl.textContent = zn; lastZone = zn; }
